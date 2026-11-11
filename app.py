@@ -59,10 +59,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------------------
-# DATA LOADING & CACHING
+# DATA LOADING & CACHING (v3 - auto Pak/Ban deduction from result + innings)
 # ------------------------------------------------------------------------------
 @st.cache_data
-def load_base_data():
+def load_base_data_v3():
     candidates = [
         "master_cricket_data.csv.gz",
         "/content/master_cricket_data.csv.gz",
@@ -87,51 +87,29 @@ def load_base_data():
     comp_str = df['comp_name'].astype(str) if 'comp_name' in df.columns else pd.Series('', index=df.index)
     df['comp_type'] = np.where(comp_str.str.contains(r'\bipl\b', case=False, na=False), 'IPL', 'T20I')
 
-    # Identify Pak & Ban players ONLY by team affiliation (NEVER by tournament name)
+    # Identify Pak & Ban players (including A / Emerging teams)
     pak_ban_ids = set()
 
     if 'is_striker_pak_ban' in df.columns:
-        pak_ban_ids.update(df[df['is_striker_pak_ban'] == True]['striker_id'].dropna().unique())
+        mask_s = df['is_striker_pak_ban'].astype(str).str.upper().isin(['TRUE', '1'])
+        pak_ban_ids.update(df[mask_s]['striker_id'].dropna().unique())
     if 'is_bowler_pak_ban' in df.columns:
-        pak_ban_ids.update(df[df['is_bowler_pak_ban'] == True]['bowler_id'].dropna().unique())
+        mask_b = df['is_bowler_pak_ban'].astype(str).str.upper().isin(['TRUE', '1'])
+        pak_ban_ids.update(df[mask_b]['bowler_id'].dropna().unique())
 
-    search_root = "/content" if os.path.exists("/content") else "."
-    all_csvs = glob.glob(f"{search_root}/**/*.csv", recursive=True)
-
-    mapping_files = [f for f in all_csvs if 'mapping' in os.path.basename(f).lower()]
-    teams_files = [
-        f for f in all_csvs
-        if 'team' in os.path.basename(f).lower()
-        and 'mapping' not in os.path.basename(f).lower()
-        and 'master' not in os.path.basename(f).lower()
-    ]
-
-    if mapping_files:
-        map_df = pd.read_csv(mapping_files[0])
-        if 'team_name' in map_df.columns and 'player_id' in map_df.columns:
-            pb_mask = map_df['team_name'].astype(str).str.contains(r'\bpakistan\b|\bbangladesh\b', case=False, na=False)
-            pak_ban_ids.update(map_df[pb_mask]['player_id'].dropna().unique())
-
-    if teams_files:
-        t_df = pd.read_csv(teams_files[0])
-        if 'team_name' in t_df.columns and 'team_id' in t_df.columns:
-            pb_team_ids = t_df[
-                t_df['team_name'].astype(str).str.contains(r'\bpakistan\b|\bbangladesh\b', case=False, na=False)
-            ]['team_id'].unique()
-            if 'batting_team_id' in df.columns:
-                pak_ban_ids.update(df[df['batting_team_id'].isin(pb_team_ids)]['striker_id'].dropna().unique())
-            if 'bowling_team_id' in df.columns:
-                pak_ban_ids.update(df[df['bowling_team_id'].isin(pb_team_ids)]['bowler_id'].dropna().unique())
-
-    # Fallback: use result + winner_id directly from master file
-    if len(pak_ban_ids) == 0 and 'result' in df.columns and 'winner_id' in df.columns:
-        win_mask = df['result'].astype(str).str.contains(r'(pakistan|bangladesh).*?\bwon\b', case=False, na=False)
-        pb_tids = {tid for tid in df[win_mask]['winner_id'].dropna().unique() if str(tid) != '0'}
-        if pb_tids:
-            if 'batting_team_id' in df.columns:
+    # Deduce exact Pak/Ban Team IDs directly from 'result' + 'innings' + 'batting_team_id'
+    if 'result' in df.columns and 'batting_team_id' in df.columns:
+        res_str = df['result'].astype(str)
+        pb_win = res_str.str.contains(r'^\s*(?:pakistan|bangladesh)(?:\s+\w+){0,2}\s+won\b', case=False, na=False)
+        if pb_win.any():
+            win_df = df[pb_win]
+            wkt_wins = win_df[win_df['result'].astype(str).str.contains(r'wkt|wicket', case=False, na=False) & (win_df['innings'] == 2)]
+            run_wins = win_df[win_df['result'].astype(str).str.contains(r'\brun', case=False, na=False) & (win_df['innings'] == 1)]
+            pb_tids = set(wkt_wins['batting_team_id'].dropna().unique()) | set(run_wins['batting_team_id'].dropna().unique())
+            if pb_tids:
                 pak_ban_ids.update(df[df['batting_team_id'].isin(pb_tids)]['striker_id'].dropna().unique())
-            if 'bowling_team_id' in df.columns:
-                pak_ban_ids.update(df[df['bowling_team_id'].isin(pb_tids)]['bowler_id'].dropna().unique())
+                if 'bowling_team_id' in df.columns:
+                    pak_ban_ids.update(df[df['bowling_team_id'].isin(pb_tids)]['bowler_id'].dropna().unique())
 
     # Standardize columns
     over_col = 'overid' if 'overid' in df.columns else ('over_id' if 'over_id' in df.columns else 'over')
@@ -314,12 +292,11 @@ def compute_metrics(df_filtered, pak_ban_ids, exclude_pak_ban, min_balls, rrr_th
 st.markdown("# 🏏 SupeRR Selector — Clutch Pressure Analytics")
 st.caption("Evaluating player reliability in high-pressure T20 match situations compared to their personal baseline.")
 
-df, pak_ban_ids = load_base_data()
+df, pak_ban_ids = load_base_data_v3()
 if df is None:
     st.error("Could not find `master_cricket_data.csv` or `master_cricket_data.csv.gz`.")
     st.stop()
 
-# Top Filter Row
 f_col1, f_col2 = st.columns([2, 1])
 available_years = sorted([int(y) for y in df['season_year'].dropna().unique()])
 default_years = [y for y in available_years if y >= 2024] or available_years[-2:]
@@ -340,23 +317,23 @@ if not selected_years:
     st.warning("Please select at least one year above.")
     st.stop()
 
-# Sidebar Controls
 st.sidebar.header("⚙️ Model Tuning")
 exclude_pb = st.sidebar.checkbox(
     f"Exclude Pak & Ban Players ({len(pak_ban_ids)} found)",
     value=True,
+    key="exclude_pb_toggle",
     help="Removes Pak/Ban players from final Top-20 rankings while keeping all balls played against them."
 )
 apply_reliability = st.sidebar.checkbox(
     "Apply Sample-Size Reliability Weighting",
     value=True,
+    key="reliability_toggle",
     help="Prevents small-sample flukes (e.g. 55 balls) from beating consistent 200+ ball performers."
 )
-min_balls = st.sidebar.slider("Min Pressure Balls Cutoff", 20, 200, 60, step=10)
+min_balls = st.sidebar.slider("Min Pressure Balls Cutoff", 20, 200, 150, step=10)
 rrr_threshold = st.sidebar.slider("Chase RRR Pressure Threshold", 7.5, 12.0, 9.0, step=0.5)
-top_n = st.sidebar.selectbox("Show Top N Players", [10, 15, 20], index=2)
+top_n = st.sidebar.selectbox("Show Top N Players", [10, 15, 20], index=0)
 
-# Apply Top Filters
 df_filtered = df[df['season_year'].isin(selected_years)]
 if comp_filter == "IPL Only":
     df_filtered = df_filtered[df_filtered['comp_type'] == 'IPL']
@@ -367,7 +344,6 @@ df_work, elig_bat, elig_bowl, most_runs, most_wickets, trigger_counts = compute_
     df_filtered, pak_ban_ids, exclude_pb, min_balls, rrr_threshold, apply_reliability
 )
 
-# Custom Full-Width KPI Cards
 k1, k2, k3, k4 = st.columns(4)
 with k1:
     st.markdown(f"""
@@ -406,18 +382,12 @@ with k4:
         <div class="kpi-sub">{top_w_sub}</div>
     </div>""", unsafe_allow_html=True)
 
-# ------------------------------------------------------------------------------
-# THREE DEDICATED TABS: BATSMEN, BOWLERS, METHODOLOGY
-# ------------------------------------------------------------------------------
 tab_bat, tab_bowl, tab_method = st.tabs([
     "🏏 Batsmen",
     "🎯 Bowlers",
     "📐 Methodology"
 ])
 
-# ==============================================================================
-# TAB 1: BATSMEN
-# ==============================================================================
 with tab_bat:
     st.subheader(f"🔥 Top {top_n} Batsmen Under Pressure")
     bat_view = elig_bat.head(top_n)[[
@@ -491,9 +461,6 @@ with tab_bat:
             r3.metric("Boundary %", f"{row_b['press_boundary_pct']:.1f}%")
             r4.metric("Dot Ball %", f"{row_b['press_dot_pct']:.1f}%")
 
-# ==============================================================================
-# TAB 2: BOWLERS
-# ==============================================================================
 with tab_bowl:
     st.subheader(f"🎯 Top {top_n} Bowlers Under Pressure")
     bowl_view = elig_bowl.head(top_n)[[
@@ -541,101 +508,4 @@ with tab_bowl:
                 labels={'base_econ': 'Baseline Economy', 'press_econ': 'Pressure Economy', 'delta_econ': 'Econ Tightened'},
                 title="Clutch Quadrant (Below Line = Tighter Under Pressure)"
             )
-            min_e = min(top_scat_w['base_econ'].min(), top_scat_w['press_econ'].min()) - 0.5
-            max_e = max(top_scat_w['base_econ'].max(), top_scat_w['press_econ'].max()) + 0.5
-            fig_scat_w.add_shape(type="line", x0=min_e, y0=min_e, x1=max_e, y1=max_e, line=dict(color="white", dash="dash", width=1))
-            fig_scat_w.update_layout(height=400, margin=dict(t=40, b=40))
-            st.plotly_chart(fig_scat_w, use_container_width=True)
-
-    st.divider()
-    col_w1, col_w2 = st.columns([1.4, 1])
-    with col_w1:
-        st.subheader("📊 Most Wickets (Overall Stats)")
-        wkts_view = most_wickets.head(15)[['bowler_name', 'matches', 'overs', 'total_wickets', 'base_econ', 'average', 'strike_rate']].copy()
-        wkts_view.columns = ['Bowler', 'Matches', 'Overs', 'Wickets', 'Econ', 'Avg', 'SR']
-        st.dataframe(wkts_view.round(2), use_container_width=True)
-    with col_w2:
-        st.subheader("🔍 Bowler Deep-Dive")
-        if len(elig_bowl) > 0:
-            player_w = st.selectbox("Select Qualified Bowler", elig_bowl['bowler_name'].tolist())
-            row_w = elig_bowl[elig_bowl['bowler_name'] == player_w].iloc[0]
-            w1, w2 = st.columns(2)
-            w1.metric("Pressure Economy", f"{row_w['press_econ']:.2f}", f"{row_w['delta_econ']:+.2f} tighter")
-            w2.metric("Clutch Score", f"{row_w['pressure_score']:.2f}")
-            w3, w4 = st.columns(2)
-            w3.metric("Dot Ball %", f"{row_w['press_dot_pct']:.1f}%")
-            w4.metric("Pressure Wickets", f"{int(row_w['press_wickets'])}")
-
-# ==============================================================================
-# TAB 3: METHODOLOGY
-# ==============================================================================
-with tab_method:
-    st.subheader("📐 How Pressure & Clutch Reliability Are Calculated")
-
-    m_col1, m_col2 = st.columns([1.2, 1])
-    with m_col1:
-        st.markdown("### 1. Defining a High-Pressure Delivery")
-        st.markdown(f"""
-        <div class="method-box">
-            <b>Condition 1 — 2nd Innings High-Stakes Chase:</b><br>
-            Overs 11–20 (≤ 60 balls remaining), target still active, competitive game (RRR ≤ 24.0), and either <b>RRR ≥ {rrr_threshold}</b> OR <b>≤ 4 wickets in hand</b> with RRR ≥ 6.0.
-        </div>
-        <div class="method-box">
-            <b>Condition 2 — 1st Innings Death Overs:</b><br>
-            Overs 16–20 when batting sides must maximize totals and bowlers execute yorkers/variations under extreme boundary threat.
-        </div>
-        <div class="method-box">
-            <b>Condition 3 — Powerplay Crisis Recovery:</b><br>
-            Overs 1–6 in either innings when <b>3 or more wickets</b> have already fallen, testing crisis composure.
-        </div>
-        <div class="method-box">
-            <b>Condition 4 — Playoffs, Knockouts & Super Overs:</b><br>
-            All deliveries in Qualifiers, Eliminators, Semi-Finals, Finals, or Super Overs where stakes are absolute.
-        </div>
-        """, unsafe_allow_html=True)
-
-    with m_col2:
-        st.markdown("### Live Delivery Breakdown")
-        trig_df = pd.DataFrame({
-            "Match Context": list(trigger_counts.keys()),
-            "Deliveries": list(trigger_counts.values())
-        })
-        fig_trig = px.bar(
-            trig_df, x="Deliveries", y="Match Context", orientation='h',
-            color="Match Context", text_auto='.2s',
-            color_discrete_sequence=['#ec4899', '#f43f5e', '#f59e0b', '#8b5cf6', '#475569']
-        )
-        fig_trig.update_layout(showlegend=False, height=380, margin=dict(t=20, b=20, l=10, r=10))
-        st.plotly_chart(fig_trig, use_container_width=True)
-
-    st.divider()
-    st.markdown("### 2. Performance Measurement & Baseline Comparison")
-    f_c1, f_c2 = st.columns(2)
-
-    with f_c1:
-        st.markdown("#### 🏏 Batting Clutch Formula")
-        st.latex(r"\text{Raw Score} = 0.45(\text{SR}_{\text{press}}) + 0.25(\Delta \text{SR}) + 0.30(\text{Boundary\%}) - 0.20(\text{Dot\%})")
-        st.markdown("""
-        - **$\Delta \text{SR} = \text{SR}_{\text{press}} - \text{SR}_{\text{base}}$**: Rewards players who accelerate under pressure compared to their own baseline.
-        - **Boundary %**: Measures six- and four-hitting ability when field pressure peaks.
-        - **Dot % Penalty**: Penalizes stalling momentum during chases or death overs.
-        """)
-
-    with f_c2:
-        st.markdown("#### 🎯 Bowling Clutch Formula")
-        st.latex(r"\text{Raw Score} = 6(12 - \text{Econ}_{\text{press}}) + 4(\Delta \text{Econ}) + 0.5(\text{Dot\%}) + 200\left(\frac{\text{Wickets}}{\text{Balls}}\right)")
-        st.markdown("""
-        - **$\Delta \text{Econ} = \text{Econ}_{\text{base}} - \text{Econ}_{\text{press}}$**: Positive values indicate bowlers who tighten up and concede *fewer* runs under pressure.
-        - **Dot %**: Measures run-choking control in crunch overs.
-        - **Wicket Threat**: Rewards game-breaking breakthroughs per ball bowled.
-        """)
-
-    st.divider()
-    st.markdown("### 3. Fair Comparisons & Reliability Safeguards")
-    st.markdown(f"""
-    - **Minimum Qualification Cutoff (`{min_balls}` balls)**: Prevents small-sample outliers (e.g., 10-ball cameos) from distorting rankings.
-    - **Bayesian Volume Confidence Weighting (`{'Enabled' if apply_reliability else 'Disabled'}`)**:
-      $$\\text{{Confidence}} = \\frac{{\\text{{Pressure Balls}}}}{{\\text{{Pressure Balls}} + 60}}$$
-      Blends a player's raw score slightly toward the cohort average when sample sizes are smaller, ensuring proven high-volume performers rank fairly.
-    - **Opponent Preservation ("vs Them" Stats)**: Pakistan & Bangladesh players are excluded from candidate rankings (`{'Enabled' if exclude_pb else 'Disabled'}`), while all deliveries bowled **to or against** them remain counted in full for eligible players.
-    """)
+            min_e = min(top_scat_w['base_econ
