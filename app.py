@@ -125,7 +125,7 @@ def load_base_data():
 
     # Fallback: use result + winner_id directly from master file
     if len(pak_ban_ids) == 0 and 'result' in df.columns and 'winner_id' in df.columns:
-        win_mask = df['result'].astype(str).str.contains(r'^\s*(pakistan|bangladesh)\s+won', case=False, na=False)
+        win_mask = df['result'].astype(str).str.contains(r'(pakistan|bangladesh).*?\bwon\b', case=False, na=False)
         pb_tids = {tid for tid in df[win_mask]['winner_id'].dropna().unique() if str(tid) != '0'}
         if pb_tids:
             if 'batting_team_id' in df.columns:
